@@ -98,6 +98,8 @@ class HardwareCapability(Enum):
     # Fuse non-MX INT8/INT4 grouped matmul, dequantization, SiTU, and per-token
     # quantization through the ACLNN GmmDequantSituQuant operator.
     GMM_DEQUANT_SITU_QUANT = auto()
+    # Register the FX graph rewrite that fuses a supported matmul/reduce-scatter pattern.
+    GRAPH_MM_REDUCE_SCATTER_FUSION = auto()
     # Register the FX graph rewrite that fuses the supported muls-plus-add pattern.
     GRAPH_MULS_ADD_FUSION = auto()
     # Register the FX graph rewrites for supported RMSNorm-plus-quant patterns.
@@ -244,6 +246,7 @@ _STANDARD_CAPABILITIES = frozenset(
         HardwareCapability.BGMV_SGMV_META_REGISTRATION,
         HardwareCapability.FLA_GDN_PREFILL,
         HardwareCapability.FUSED_SWIGLU_TUNING_ARGS,
+        HardwareCapability.GRAPH_MM_REDUCE_SCATTER_FUSION,
         HardwareCapability.GRAPH_MULS_ADD_FUSION,
         HardwareCapability.GRAPH_NORM_QUANT_FUSION,
         HardwareCapability.GRAPH_QKV_NORM_ROPE_FUSION,
@@ -349,6 +352,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
                     HardwareCapability.DYNAMIC_MX_QUANT_SCALE_ALG_ONE,
                     HardwareCapability.FLA_GDN_PREFILL,
                     HardwareCapability.FP8_ATTENTION,
+                    HardwareCapability.GRAPH_MM_REDUCE_SCATTER_FUSION,
                     HardwareCapability.GRAPH_MULS_ADD_FUSION,
                     HardwareCapability.GRAPH_NORM_QUANT_FUSION,
                     HardwareCapability.LOCAL_KV_COMM_RESOURCE,
