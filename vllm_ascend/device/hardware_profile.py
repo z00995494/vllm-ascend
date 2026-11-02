@@ -107,6 +107,8 @@ class HardwareCapability(Enum):
     GDN_COMPATIBILITY = auto()
     # Register the FX graph rewrite that fuses a supported matmul/reduce-scatter pattern.
     GRAPH_MM_REDUCE_SCATTER_FUSION = auto()
+    # Fuse token all-gather with a supported column-parallel projection.
+    GRAPH_ALL_GATHER_MATMUL_FUSION = auto()
     # Register the FX graph rewrite that fuses the supported muls-plus-add pattern.
     GRAPH_MULS_ADD_FUSION = auto()
     # Register the FX graph rewrites for supported RMSNorm-plus-quant patterns.
@@ -258,6 +260,7 @@ _STANDARD_CAPABILITIES = frozenset(
         HardwareCapability.FUSED_ROTARY_MUL_INTERLEAVE,
         HardwareCapability.FUSED_SWIGLU_TUNING_ARGS,
         HardwareCapability.GRAPH_MM_REDUCE_SCATTER_FUSION,
+        HardwareCapability.GRAPH_ALL_GATHER_MATMUL_FUSION,
         HardwareCapability.GRAPH_MULS_ADD_FUSION,
         HardwareCapability.GRAPH_NORM_QUANT_FUSION,
         HardwareCapability.GRAPH_QKV_NORM_ROPE_FUSION,

@@ -77,3 +77,7 @@ class GraphFusionPassManager:
             from .passes.mm_reduce_scatter_fusion_pass import MatmulReduceScatterFusionPass
 
             self.passes.append(MatmulReduceScatterFusionPass(config))
+        if fuse_gemm_comms and profile.supports(HardwareCapability.GRAPH_ALL_GATHER_MATMUL_FUSION):
+            from .passes.all_gather_matmul_fusion_pass import AllGatherMatmulFusionPass
+
+            self.passes.append(AllGatherMatmulFusionPass(config))

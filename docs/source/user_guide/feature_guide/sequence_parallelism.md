@@ -48,16 +48,21 @@ Steps to follow to enable SP currently:
 > [!NOTE]
 > **Difference from upstream.** Upstream vLLM enables MoE sequence parallelism only when `data_parallel_size > 1`, together with a supported all2all backend, expert parallelism, and `tensor_parallel_size > 1`. On vLLM Ascend, `data_parallel_size > 1` is not part of the enablement condition. Ascend FlashComm also supports the TP/EP topology with `data_parallel_size = 1`, so SP MoE can be enabled when DP is 1 as long as the conditions above are met. `data_parallel_size > 1` remains supported.
 
-### Matmul reduce-scatter fusion
+### Communication and matmul fusion
 
-On supported Ascend devices, enable `fuse_gemm_comms` to fuse a
-sequence-parallel, bias-free row-parallel projection with its token-dimension
-reduce-scatter. The fused implementation supports BF16/FP16 with TP size 2,
-4, or 8; unmatched graphs continue to use the unfused path.
+On supported Ascend devices, sequence parallelism enables graph fusion for
+bias-free FP16/BF16 projections with TP size 2, 4, or 8. Row-parallel matmul
+can fuse with reduce-scatter; on A2/A3, token-dimension all-gather can fuse
+with a column-parallel matmul, including a token-prefix slice between them.
 
-```bash
---compilation-config '{"pass_config":{"fuse_gemm_comms":true}}'
-```
+All-gather fusion requires contiguous 2D inputs and weights and a static
+reduction dimension in [256, 65535). Graphs with bias, multiple consumers of
+the gathered input, or unsupported layouts remain unfused. The fused
+projection preserves token-prefix unpadding at its output.
+
+These passes use the FlashComm/SP configuration below on current vLLM main.
+The former upstream `pass_config.fuse_gemm_comms` option has been removed;
+there is no separate AG+matmul CLI switch.
 
 ### FlashComm switch (Ascend only)
 

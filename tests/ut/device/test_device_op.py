@@ -4,7 +4,12 @@ from unittest import mock
 import pytest
 import torch
 
-from vllm_ascend.device.device_op import A5DeviceAdaptor, Ascend310PDeviceAdaptor, BaseDeviceAdaptor
+from vllm_ascend.device.device_op import (
+    A5DeviceAdaptor,
+    Ascend310PDeviceAdaptor,
+    BaseDeviceAdaptor,
+    get_device_adaptor,
+)
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 
@@ -334,3 +339,21 @@ def test_clipped_swiglu_kernel_selection_per_adaptor(adaptor, uses_fused_kernel)
     gate = torch.clamp(x[..., :d], max=limit)
     up = torch.clamp(x[..., d:], min=-limit, max=limit)
     torch.testing.assert_close(out, gate * torch.sigmoid(alpha * gate) * (up + beta))
+
+
+@pytest.mark.parametrize(
+    ("device_type", "adaptor"),
+    [
+        (AscendDeviceType.A2, BaseDeviceAdaptor),
+        (AscendDeviceType.A3, BaseDeviceAdaptor),
+        (AscendDeviceType.A5, A5DeviceAdaptor),
+        (AscendDeviceType._310P, Ascend310PDeviceAdaptor),
+    ],
+)
+def test_adaptor_selection_preserves_device_families(device_type, adaptor):
+    with mock.patch(
+        "vllm_ascend.device.device_op.get_current_hardware_profile",
+        return_value=get_hardware_profile(device_type),
+    ):
+        assert get_device_adaptor() is adaptor
+    assert issubclass(adaptor, BaseDeviceAdaptor)

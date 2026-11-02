@@ -70,3 +70,38 @@ class TestGraphFusionPassManagerConfig(TestBase):
             manager.configure(vllm_config)
 
         self.assertEqual(len(manager.passes), 1)
+
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_agmm_registration_requires_sp_and_hardware_support(self, mock_platform):
+        module = "vllm_ascend.compilation.graph_fusion_pass_manager"
+        agmm_module = "vllm_ascend.compilation.passes.all_gather_matmul_fusion_pass"
+        for sp_enabled in (False, True):
+            for supported in (False, True):
+                with self.subTest(sp=sp_enabled, hardware=supported):
+                    config = VllmConfig()
+                    config.additional_config = {
+                        "ascend_compilation_config": {
+                            "fuse_norm_quant": False,
+                            "fuse_qknorm_rope": False,
+                            "fuse_muls_add": False,
+                        }
+                    }
+                    clear_ascend_config()
+                    init_ascend_config(config)
+                    profile = MagicMock()
+                    profile.supports.side_effect = lambda cap, supported=supported: (
+                        supported and cap.name == "GRAPH_ALL_GATHER_MATMUL_FUSION"
+                    )
+                    with (
+                        patch(f"{module}.enable_sp", return_value=sp_enabled),
+                        patch(f"{module}.get_current_hardware_profile", return_value=profile),
+                        patch(f"{agmm_module}.AllGatherMatmulFusionPass") as agmm,
+                    ):
+                        manager = GraphFusionPassManager()
+                        manager.configure(config)
+                    if sp_enabled and supported:
+                        agmm.assert_called_once_with(config)
+                        self.assertEqual(manager.passes, [agmm.return_value])
+                    else:
+                        agmm.assert_not_called()
+                        self.assertEqual(manager.passes, [])

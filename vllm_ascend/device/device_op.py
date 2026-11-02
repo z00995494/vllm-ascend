@@ -314,6 +314,30 @@ class BaseDeviceAdaptor:
         )
 
     @staticmethod
+    def npu_all_gather_base_mm(
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        hcom: str,
+        world_size: int,
+        *,
+        gather_output: bool = False,
+    ):
+        # Gated by GRAPH_ALL_GATHER_MATMUL_FUSION (currently A2/A3 only);
+        # unreachable on families without the capability, same as MMRS on 310P.
+        # comm_mode="ai_cpu": the aiv mode of this op crashes the device
+        # (507057) on A3 + CANN 9.2.0 in op-level tests; ai_cpu passes and
+        # covers the bias-free non-quantized scenario this wrapper targets.
+        return torch_npu.npu_all_gather_base_mm(
+            x1,
+            x2,
+            hcom,
+            world_size,
+            gather_index=0,
+            gather_output=gather_output,
+            comm_mode="ai_cpu",
+        )
+
+    @staticmethod
     def npu_dynamic_quant(
         hidden_states: torch.Tensor,
         dynamic_scale: torch.Tensor | None = None,
