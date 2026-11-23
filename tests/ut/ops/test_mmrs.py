@@ -6,9 +6,13 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
 from vllm_ascend.ops import mmrs
+from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+from vllm_ascend.quantization.prepared_linear_input import PreparedLinearInput
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 ATTENTION_LAYER_NAME = "model.layers.0.self_attn.attn"
@@ -385,3 +389,444 @@ def test_weight_changes_are_picked_up_without_cache(harness):
     h.layer.weight.fill_(3)
     torch.testing.assert_close(h.op.run(x), h.scatter(h.projection(h.layer, x, None)))
     assert h.weight_format.call_count == 3  # validated on every fused forward
+
+
+# ---------------------------------------------------------------------------
+# INT8 W8A8_DYNAMIC backend
+# ---------------------------------------------------------------------------
+
+
+def make_int8_layer(tp_size=2):
+    scheme = AscendW8A8DynamicLinearMethod()
+    adapter = AscendLinearMethod.__new__(AscendLinearMethod)
+    adapter.quant_method = scheme
+    return SimpleNamespace(
+        custom_op=None,
+        reduce_results=False,
+        input_is_parallel=True,
+        disable_tp=False,
+        bias=None,
+        tp_size=tp_size,
+        tp_rank=0,
+        quant_method=adapter,
+        # Loaded INT8 weights are already [K, N].
+        weight=torch.ones(256, 32, dtype=torch.int8),
+        weight_scale_fp32=torch.full((32,), 0.25),
+        skip_bias_add=False,
+        return_bias=True,
+        input_size_per_partition=256,
+        output_size=32,
+        prefix="model.layers.0.self_attn.o_proj",
+    )
+
+
+def make_int8_op(layer, min_tokens=1, max_tokens=65535):
+    return mmrs.SequenceParallelQuantMMReduceScatterOp(
+        layer, ATTENTION_LAYER_NAME, min_tokens=min_tokens, max_tokens=max_tokens
+    )
+
+
+@pytest.fixture
+def int8_harness():
+    layer = make_int8_layer()
+    group = Mock(world_size=2, rank_in_group=0)
+    group.device_group._get_backend.return_value.get_hccl_comm_name.return_value = "original-tp"
+    metadata = SimpleNamespace(num_prefills=1, num_decodes=0)
+    context = SimpleNamespace(attn_metadata={ATTENTION_LAYER_NAME: metadata})
+    config = make_config(compilation_config=SimpleNamespace(static_forward_context={}))
+    profile = Mock()
+    profile.supports.return_value = True
+    with (
+        patch("vllm_ascend.ops.linear_op.get_tp_group", return_value=group),
+        patch.object(mmrs, "is_forward_context_available", return_value=True),
+        patch.object(mmrs, "get_forward_context", return_value=context),
+        patch.object(mmrs, "get_current_vllm_config", return_value=config),
+        patch.object(mmrs, "get_current_hardware_profile", return_value=profile),
+        patch.object(
+            mmrs.torch_npu, "get_npu_format", return_value=mmrs.ACL_FORMAT_FRACTAL_ND, create=True
+        ) as weight_format,
+        # The CPU torch_npu wheel has no fused quant MM+ReduceScatter entry
+        # point; provide one so the static gate can pass on any platform.
+        patch.object(mmrs.torch_npu, "npu_quant_mm_reduce_scatter", create=True) as fused,
+        patch.object(mmrs, "sp_reduce_scatter") as reduce_scatter,
+    ):
+        op = make_int8_op(layer)
+
+        def prepare(owner, x):
+            return PreparedLinearInput(x.to(torch.int8), torch.full((x.shape[0],), 0.5), x.dtype)
+
+        def projection(owner, x, bias):
+            return (x.to(torch.int8).float().matmul(owner.weight.float()) * 0.5 * owner.weight_scale_fp32).to(x.dtype)
+
+        def scatter(x):
+            padded = torch.nn.functional.pad(x, (0, 0, 0, (-x.shape[0]) % group.world_size))
+            return (padded * group.world_size).chunk(group.world_size, dim=0)[group.rank_in_group]
+
+        def fused_projection(x1, x2, hcom, world_size, **kwargs):
+            assert x1.shape[0] % world_size == 0
+            partial = (x1.float().matmul(x2.float()) * kwargs["x1_scale"] * kwargs["x2_scale"]).to(kwargs["y_dtype"])
+            return scatter(partial), torch.empty(0)
+
+        layer.quant_method.quant_method.prepare_input_for_overlap = Mock(side_effect=prepare)
+        layer.quant_method.apply = Mock(side_effect=projection)
+        fused.side_effect = fused_projection
+        reduce_scatter.side_effect = scatter
+        yield SimpleNamespace(
+            layer=layer,
+            op=op,
+            group=group,
+            metadata=metadata,
+            context=context,
+            config=config,
+            profile=profile,
+            fused=fused,
+            reduce_scatter=reduce_scatter,
+            projection=projection,
+            scatter=scatter,
+            weight_format=weight_format,
+        )
+
+
+def test_int8_installation_registers_the_layer_for_compile_dispatch():
+    layer = make_int8_layer()
+    group = Mock(world_size=2, rank_in_group=0)
+    group.device_group._get_backend.return_value.get_hccl_comm_name.return_value = "original-tp"
+    config = make_config(compilation_config=SimpleNamespace(static_forward_context={}))
+    profile = Mock()
+    profile.supports.return_value = True
+    with (
+        patch("vllm_ascend.ops.linear_op.get_tp_group", return_value=group),
+        patch.object(mmrs, "get_current_vllm_config", return_value=config),
+        patch.object(mmrs, "get_current_hardware_profile", return_value=profile),
+        patch.object(mmrs.torch_npu, "npu_quant_mm_reduce_scatter", create=True),
+    ):
+        op = make_int8_op(layer)
+        assert config.compilation_config.static_forward_context[layer.prefix] is layer
+        # Rebuilding for the same layer object is idempotent; a different
+        # object under the same prefix is a collision.
+        make_int8_op(layer)
+        with pytest.raises(ValueError, match="Duplicate layer name"):
+            make_int8_op(make_int8_layer())
+    assert op._static_reason is None
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+@pytest.mark.parametrize("tokens", [1, 3, 8])
+def test_int8_fused_projection_matches_mm_plus_rs_on_every_rank(int8_harness, tp_size, tokens):
+    h = int8_harness
+    h.group.world_size = tp_size
+    x = torch.arange(tokens * 256).remainder(4).reshape(tokens, 256).to(torch.bfloat16)
+    for rank in range(tp_size):
+        h.group.rank_in_group = rank
+        expected = h.scatter(h.projection(h.layer, x, None))
+        actual = h.op.run(x)
+        torch.testing.assert_close(actual, expected)
+        assert actual.shape == ((tokens + tp_size - 1) // tp_size, 32)
+    h.reduce_scatter.assert_not_called()
+    h.layer.quant_method.apply.assert_not_called()
+    args, kwargs = h.fused.call_args
+    assert args[1] is h.layer.weight  # Loaded INT8 weights are already [K, N].
+    assert args[2:4] == ("original-tp", tp_size)
+    assert kwargs["x1_scale"].shape == (args[0].shape[0], 1)
+    assert kwargs["x2_scale"].shape == (1, 32)
+    assert kwargs["comm_mode"] == "aiv"
+    assert kwargs["y_dtype"] == torch.bfloat16
+    assert kwargs["reduce_op"] == "sum"
+    if tokens % tp_size:
+        assert torch.count_nonzero(args[0][tokens:]) == 0
+        torch.testing.assert_close(kwargs["x1_scale"][tokens:], torch.ones_like(kwargs["x1_scale"][tokens:]))
+
+
+@pytest.mark.parametrize("tokens,expected", [(16383, False), (16384, True), (40960, True), (40961, False)])
+def test_int8_token_limit_boundaries(int8_harness, tokens, expected):
+    # The INT8 backend fuses inside the 16k-40k benefit range (exclusive
+    # upper bound); other batch sizes stay on the plain quant MM + RS path.
+    h = int8_harness
+    op = make_int8_op(h.layer, min_tokens=16384, max_tokens=40961)
+    x = torch.ones(tokens, 256, dtype=torch.bfloat16)
+    assert op._can_fuse(x) is expected
+    torch.testing.assert_close(op.run(x), h.scatter(h.projection(h.layer, x, None)))
+    assert h.fused.called is expected
+    assert h.reduce_scatter.called is not expected
+
+
+@pytest.mark.parametrize("prefills,decodes", [(0, 2), (1, 1)])
+def test_int8_decode_and_mixed_fallback_preserve_shards(int8_harness, prefills, decodes):
+    h = int8_harness
+    h.metadata.num_prefills = prefills
+    h.metadata.num_decodes = decodes
+    x = torch.ones(3, 256, dtype=torch.bfloat16)
+    torch.testing.assert_close(h.op.run(x), h.scatter(h.projection(h.layer, x, None)))
+    h.fused.assert_not_called()
+    h.layer.quant_method.apply.assert_called_once_with(h.layer, x, None)
+    h.reduce_scatter.assert_called_once()
+
+
+@pytest.mark.parametrize("metadata", [None, {}, {"another.attn": SimpleNamespace(num_prefills=1, num_decodes=0)}])
+def test_int8_missing_or_unrelated_metadata_falls_back(int8_harness, metadata):
+    h = int8_harness
+    h.context.attn_metadata = metadata
+    assert h.op.run(torch.ones(1, 256, dtype=torch.bfloat16)).shape == (1, 32)
+    h.fused.assert_not_called()
+    h.reduce_scatter.assert_called_once()
+
+
+@pytest.mark.parametrize("weight_format", [2, 29])
+def test_int8_nd_and_nz_weights_feed_the_fused_op_as_nd(int8_harness, weight_format):
+    h = int8_harness
+    h.weight_format.return_value = weight_format
+    # Simulate replacement by the weight loader after custom-op construction.
+    h.layer.weight = torch.full((256, 32), 2, dtype=torch.int8)
+    h.layer.weight_scale_fp32 = torch.full((32,), 0.5)
+    x = torch.ones(2, 256, dtype=torch.bfloat16)
+    with patch.object(mmrs.torch_npu, "npu_format_cast", side_effect=lambda w, fmt: w.clone()) as format_cast:
+        torch.testing.assert_close(h.op.run(x), h.scatter(h.projection(h.layer, x, None)))
+        fed = h.fused.call_args.args[1]
+        if weight_format == mmrs.ACL_FORMAT_FRACTAL_ND:
+            assert fed is h.layer.weight
+            format_cast.assert_not_called()
+            return
+        # NZ weights reach the fused operator only as a cached ND copy.
+        assert fed is not h.layer.weight
+        format_cast.assert_called_once_with(h.layer.weight, mmrs.ACL_FORMAT_FRACTAL_ND)
+        h.op.run(x)
+        assert format_cast.call_count == 1  # Cache hit: no repeated conversion.
+        h.layer.weight = torch.full((256, 32), 2, dtype=torch.int8)
+        torch.testing.assert_close(h.op.run(x), h.scatter(h.projection(h.layer, x, None)))
+        assert format_cast.call_count == 2  # Reloaded weight is re-converted once.
+
+
+def test_int8_non_bf16_input_falls_back(int8_harness):
+    h = int8_harness
+    x = torch.ones(3, 256, dtype=torch.float16)
+    torch.testing.assert_close(h.op.run(x), h.scatter(h.projection(h.layer, x, None)))
+    h.fused.assert_not_called()
+    h.reduce_scatter.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "bad_case",
+    ["weight_dtype", "weight_shape", "missing_scale", "scale_dtype", "scale_shape", "format", "small_k", "empty"],
+)
+def test_int8_unsupported_runtime_layout_is_rejected_before_collective(int8_harness, bad_case):
+    h = int8_harness
+    x = torch.ones(2, 256, dtype=torch.bfloat16)
+    if bad_case == "weight_dtype":
+        h.layer.weight = h.layer.weight.float()
+    elif bad_case == "weight_shape":
+        h.layer.weight = h.layer.weight.t()
+    elif bad_case == "missing_scale":
+        h.layer.weight_scale_fp32 = None
+    elif bad_case == "scale_dtype":
+        h.layer.weight_scale_fp32 = h.layer.weight_scale_fp32.to(torch.bfloat16)
+    elif bad_case == "scale_shape":
+        h.layer.weight_scale_fp32 = h.layer.weight_scale_fp32.reshape(-1, 1)
+    elif bad_case == "format":
+        h.weight_format.return_value = 3
+    elif bad_case == "small_k":
+        x = x[:, :128]
+    elif bad_case == "empty":
+        x = x[:0]
+    assert not h.op._can_fuse(x)
+    h.fused.assert_not_called()
+
+
+def test_int8_fused_failure_is_not_retried_as_another_collective(int8_harness):
+    h = int8_harness
+    h.fused.side_effect = RuntimeError("collective failed")
+    with pytest.raises(RuntimeError, match="collective failed"):
+        h.op.run(torch.ones(2, 256, dtype=torch.bfloat16))
+    h.reduce_scatter.assert_not_called()
+
+
+def test_int8_apply_follows_return_bias_contract(int8_harness):
+    h = int8_harness
+    expected = torch.ones(1, 32, dtype=torch.bfloat16)
+    with patch.object(torch.ops.vllm, "ascend_sequence_parallel_int8_mmrs", return_value=expected):
+        output, bias = h.op.apply(torch.ones(2, 256, dtype=torch.bfloat16))
+        assert output is expected and bias is None
+        h.op.return_bias = False
+        assert h.op.apply(torch.ones(2, 256, dtype=torch.bfloat16)) is expected
+
+
+@pytest.mark.parametrize(
+    "attribute,value",
+    [
+        ("bias", torch.ones(32)),
+        ("reduce_results", True),
+        ("input_is_parallel", False),
+        ("disable_tp", True),
+        ("quant_method", object()),
+        ("quant_method", UnquantizedLinearMethod()),
+    ],
+)
+def test_int8_static_layer_rejections_never_fuse(int8_harness, attribute, value):
+    # Installation always succeeds; an unsupported layer simply never leaves
+    # the fallback path.
+    h = int8_harness
+    setattr(h.layer, attribute, value)
+    op = make_int8_op(h.layer)
+    assert op._static_reason is not None
+    assert op._can_fuse(torch.ones(2, 256, dtype=torch.bfloat16)) is False
+    h.fused.assert_not_called()
+
+
+def test_int8_other_quantization_subclasses_are_not_accepted():
+    class OtherScheme(AscendW8A8DynamicLinearMethod):
+        pass
+
+    layer = make_int8_layer()
+    layer.quant_method.quant_method = OtherScheme()
+    assert not mmrs.SequenceParallelQuantMMReduceScatterOp.accepts(layer)
+    assert mmrs.SequenceParallelQuantMMReduceScatterOp.accepts(make_int8_layer())
+    assert not mmrs.SequenceParallelQuantMMReduceScatterOp.accepts(make_layer())
+
+
+@pytest.mark.parametrize("tp_size", [1, 16])
+def test_int8_unsupported_tp_size_never_fuses(int8_harness, tp_size):
+    h = int8_harness
+    h.group.world_size = tp_size
+    op = make_int8_op(h.layer)
+    assert op._static_reason is not None
+    assert op._can_fuse(torch.ones(2, 256, dtype=torch.bfloat16)) is False
+    h.fused.assert_not_called()
+
+
+def test_int8_existing_custom_op_keeps_ownership(int8_harness):
+    # A pre-existing custom op (e.g. fine-grained OTP) owns the layer's
+    # communication; this op only delegates and never fuses.
+    h = int8_harness
+    previous = Mock()
+    sentinel = torch.ones(2, 32)
+    previous.apply_impl.return_value = (sentinel, None)
+    h.layer.custom_op = previous
+    op = make_int8_op(h.layer)
+    assert op._static_reason is not None
+    x = torch.ones(2, 256, dtype=torch.bfloat16)
+    assert op._can_fuse(x) is False
+    output, bias = op.apply_impl(x)
+    previous.apply_impl.assert_called_once_with(x)
+    assert output is sentinel and bias is None
+    h.fused.assert_not_called()
+    h.layer.quant_method.apply.assert_not_called()
+
+
+def test_int8_non_parallel_input_is_split_before_fallback(int8_harness):
+    # A non-TP-partitioned input never fuses, and the fallback still splits
+    # it along the last dim like the original forward.
+    h = int8_harness
+    h.layer.input_is_parallel = False
+    op = make_int8_op(h.layer)
+    assert op._static_reason is not None
+    x = torch.arange(2 * 512, dtype=torch.float32).remainder(5).reshape(2, 512).to(torch.bfloat16)
+    output = op.run(x)
+    applied = h.layer.quant_method.apply.call_args.args[1]
+    torch.testing.assert_close(applied, x[:, :256].contiguous())
+    torch.testing.assert_close(output, h.scatter(h.projection(h.layer, x[:, :256], None)))
+    h.fused.assert_not_called()
+
+
+@pytest.mark.parametrize("gate", ["lora", "decode_node", "pcp", "dcp", "hardware"])
+def test_int8_config_and_hardware_gates_only_disable_fusion(int8_harness, gate):
+    # Every install-time fact only disables fusion; the op still owns the
+    # ReduceScatter on the fallback path.
+    h = int8_harness
+    config = make_config(compilation_config=SimpleNamespace(static_forward_context={}))
+    profile = Mock()
+    profile.supports.return_value = True
+    if gate == "lora":
+        config.lora_config = object()
+    elif gate == "decode_node":
+        config.kv_transfer_config = SimpleNamespace(is_kv_consumer=True, is_kv_producer=False)
+    elif gate == "pcp":
+        config.parallel_config.prefill_context_parallel_size = 2
+    elif gate == "dcp":
+        config.parallel_config.decode_context_parallel_size = 2
+    elif gate == "hardware":
+        profile.supports.side_effect = (
+            lambda capability: capability is not mmrs.HardwareCapability.MM_REDUCE_SCATTER_INT8_AIV
+        )
+    with (
+        patch.object(mmrs, "get_current_vllm_config", return_value=config),
+        patch.object(mmrs, "get_current_hardware_profile", return_value=profile),
+    ):
+        op = make_int8_op(h.layer)
+    assert op._static_reason is not None
+    x = torch.ones(3, 256, dtype=torch.bfloat16)
+    torch.testing.assert_close(op.run(x), h.scatter(h.projection(h.layer, x, None)))
+    h.fused.assert_not_called()
+    h.reduce_scatter.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "kv_role,expected",
+    [
+        (None, True),  # No PD split: the node serves prefill.
+        ("kv_producer", True),  # Pure prefill node.
+        ("kv_both", True),  # Producer and consumer.
+        ("kv_consumer", False),  # Pure decode node: fusion can never fire.
+    ],
+)
+def test_int8_pd_node_role_only_gates_fusion(int8_harness, kv_role, expected):
+    h = int8_harness
+    transfer = None
+    if kv_role is not None:
+        transfer = SimpleNamespace(
+            is_kv_producer=kv_role in ("kv_producer", "kv_both"),
+            is_kv_consumer=kv_role in ("kv_consumer", "kv_both"),
+        )
+    config = make_config(
+        kv_transfer_config=transfer,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    with patch.object(mmrs, "get_current_vllm_config", return_value=config):
+        op = make_int8_op(h.layer)
+    assert (op._static_reason is None) is expected
+    x = torch.ones(2, 256, dtype=torch.bfloat16)
+    torch.testing.assert_close(op.run(x), h.scatter(h.projection(h.layer, x, None)))
+    assert h.fused.called is expected
+    assert h.reduce_scatter.called is not expected
+
+
+def test_int8_fusion_queries_the_int8_mmrs_capability(int8_harness):
+    h = int8_harness
+    profile = Mock()
+    profile.supports.return_value = True
+    with patch.object(mmrs, "get_current_hardware_profile", return_value=profile):
+        make_int8_op(h.layer)
+    assert profile.supports.call_args.args[0] is mmrs.HardwareCapability.MM_REDUCE_SCATTER_INT8_AIV
+
+
+def test_int8_weight_changes_are_picked_up_and_revalidated(int8_harness):
+    # Weight and scale are re-read on every fused forward; nothing about
+    # them is cached beyond the ND shadow of an NZ weight.
+    h = int8_harness
+    x = torch.ones(2, 256, dtype=torch.bfloat16)
+    first = h.op.run(x)
+    torch.testing.assert_close(first, h.scatter(h.projection(h.layer, x, None)))
+    h.layer.weight = torch.full((256, 32), 2, dtype=torch.int8)
+    second = h.op.run(x)
+    torch.testing.assert_close(second, h.scatter(h.projection(h.layer, x, None)))
+    torch.testing.assert_close(second, first * 2)
+    h.layer.weight.fill_(3)
+    torch.testing.assert_close(h.op.run(x), h.scatter(h.projection(h.layer, x, None)))
+    # Revalidated twice per fused forward: the layout gate in _can_fuse and
+    # the ND/NZ dispatch in _run_fused.
+    assert h.weight_format.call_count == 6
+
+
+def test_int8_runtime_dispatch_uses_current_layer(int8_harness):
+    h = int8_harness
+    h.layer.custom_op = h.op
+    h.context.no_compile_layers = {h.layer.prefix: h.layer}
+    x = torch.ones(3, 256, dtype=torch.bfloat16)
+    actual = mmrs._sequence_parallel_int8_mmrs(x, h.layer.prefix, 32, 2)
+    torch.testing.assert_close(actual, h.scatter(h.projection(h.layer, x, None)))
+
+
+def test_int8_fake_registration_returns_shard_without_communication():
+    with FakeTensorMode():
+        x = torch.empty(3, 256, dtype=torch.bfloat16)
+        output = torch.ops.vllm.ascend_sequence_parallel_int8_mmrs(x, "unregistered.layer", 32, 2)
+        assert output.shape == (2, 32)
+        assert output.dtype == x.dtype

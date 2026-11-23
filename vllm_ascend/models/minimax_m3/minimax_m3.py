@@ -116,7 +116,8 @@ from vllm_ascend.models.minimax_m3.msa_m3 import (
     _register_m3_sparse_packed_modules,
     _use_fused_qkv_indexer,
 )
-from vllm_ascend.ops.mmrs import SequenceParallelMMReduceScatterOp
+from vllm_ascend.ops.agmm import install_sequence_parallel_agmm
+from vllm_ascend.ops.mmrs import SequenceParallelMMReduceScatterOp, SequenceParallelQuantMMReduceScatterOp
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, vllm_version_is
 from vllm_ascend.worker.v2.pp_transport import (
     PPTransportDataType,
@@ -133,6 +134,12 @@ _MAX_FUSED_QKNORM_ROPE_CACHE_INSERT_TOKENS = 262144
 # token-count range; other batches stay on the plain MM + ReduceScatter path.
 _MMRS_MIN_TOKENS = 256
 _MMRS_MAX_TOKENS = 16384
+# INT8 (W8A8) layer fusion pays off for prefill batches between 16k and 40k
+# tokens on A3 (measured); the upper bound stays exclusive like the BF16
+# range, so 40k itself is included. Both the O-projection MMRS and the
+# dense-MLP AllGather + MatMul use this range.
+_INT8_FUSION_MIN_TOKENS = 16384
+_INT8_FUSION_MAX_TOKENS = 40961
 
 
 def _resolve_layer_kv_cache_dtype(
@@ -701,6 +708,14 @@ class MiniMaxM3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
+        # Optionally transfer the pre-MLP AllGather into the gate_up
+        # projection; fused and fallback paths both see the full sequence.
+        self.fuse_gate_up_all_gather_mm = install_sequence_parallel_agmm(
+            self.gate_up_proj,
+            sequence_parallel=is_sequence_parallel,
+            min_tokens=_INT8_FUSION_MIN_TOKENS,
+            max_tokens=_INT8_FUSION_MAX_TOKENS,
+        )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -730,11 +745,13 @@ class MiniMaxM3MLP(nn.Module):
         self,
         x,
     ):
-        if self.is_sequence_parallel:
+        if self.is_sequence_parallel and not self.fuse_gate_up_all_gather_mm:
             # TP-sharded dense weights must see the same token rows on every
             # rank. Restore the padded full sequence for the MLP, then reduce
             # its TP partial output back to the rank-local SP shard.
             x = sp_all_gather(x)
+        # `sp_all_gather` is included in `SequenceParallelAllGatherMMOp`
+        # when `fuse_gate_up_all_gather_mm` is set.
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -1047,14 +1064,23 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # to the O-projection: fused MMRS when possible, plain MM +
         # ReduceScatter otherwise; both paths return the SP token shard, so
         # no external ReduceScatter is needed here. Without SP the
-        # O-projection keeps its plain GEMM forward.
+        # O-projection keeps its plain GEMM forward. INT8 W8A8_DYNAMIC
+        # projections get the quantized backend with its own benefit range.
         if self.use_sequence_parallel:
-            self.self_attn.o_proj.custom_op = SequenceParallelMMReduceScatterOp(
-                self.self_attn.o_proj,
-                attention_layer_name=f"{prefix}.self_attn.attn",
-                min_tokens=_MMRS_MIN_TOKENS,
-                max_tokens=_MMRS_MAX_TOKENS,
-            )
+            if SequenceParallelQuantMMReduceScatterOp.accepts(self.self_attn.o_proj):
+                self.self_attn.o_proj.custom_op = SequenceParallelQuantMMReduceScatterOp(
+                    self.self_attn.o_proj,
+                    attention_layer_name=f"{prefix}.self_attn.attn",
+                    min_tokens=_INT8_FUSION_MIN_TOKENS,
+                    max_tokens=_INT8_FUSION_MAX_TOKENS,
+                )
+            else:
+                self.self_attn.o_proj.custom_op = SequenceParallelMMReduceScatterOp(
+                    self.self_attn.o_proj,
+                    attention_layer_name=f"{prefix}.self_attn.attn",
+                    min_tokens=_MMRS_MIN_TOKENS,
+                    max_tokens=_MMRS_MAX_TOKENS,
+                )
 
         if self.is_layer_sparse:
             self.block_sparse_moe = MiniMaxM3MoE(

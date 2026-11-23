@@ -76,6 +76,7 @@ _EXPECTED_CAPABILITIES = {
         HardwareCapability.CANN_MEGAMOE_SHARED_EXPERT_FUSION,
         HardwareCapability.MC2_FULLMESH_V2_COMM,
         HardwareCapability.MM_REDUCE_SCATTER_BF16,
+        HardwareCapability.MM_REDUCE_SCATTER_INT8_AIV,
         HardwareCapability.RMS_NORM_CAST,
         HardwareCapability.FLASH_ATTN_NPU_3,
         HardwareCapability.MOE_DISPATCH_EXTRA_ARGS,

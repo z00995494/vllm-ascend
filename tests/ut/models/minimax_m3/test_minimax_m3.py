@@ -20,6 +20,8 @@ from vllm_ascend.models.minimax_m3 import (
     _sparse_attention_layer_ids,
 )
 from vllm_ascend.models.minimax_m3.minimax_m3 import (
+    _INT8_FUSION_MAX_TOKENS,
+    _INT8_FUSION_MIN_TOKENS,
     _MMRS_MAX_TOKENS,
     _MMRS_MIN_TOKENS,
     MiniMaxM3DecoderLayer,
@@ -133,6 +135,9 @@ class TestMiniMaxM3Modeling(unittest.TestCase):
     def test_mmrs_token_limits(self):
         self.assertEqual(_MMRS_MIN_TOKENS, 256)
         self.assertEqual(_MMRS_MAX_TOKENS, 16384)
+        # INT8 fusion benefit range: 16k–40k inclusive (exclusive upper bound).
+        self.assertEqual(_INT8_FUSION_MIN_TOKENS, 16384)
+        self.assertEqual(_INT8_FUSION_MAX_TOKENS, 40961)
 
     def test_pp_auxiliary_states_match_unsplit_target(self):
         from vllm.v1.worker.gpu.pp_utils import PPHandler
@@ -307,6 +312,7 @@ class TestMiniMaxM3Modeling(unittest.TestCase):
         mlp = MiniMaxM3MLP.__new__(MiniMaxM3MLP)
         nn.Module.__init__(mlp)
         mlp.is_sequence_parallel = True
+        mlp.fuse_gate_up_all_gather_mm = False
         mlp.gate_up_proj = _Linear()
         mlp.act_fn = nn.Identity()
         mlp.down_proj = _Linear()
@@ -317,6 +323,35 @@ class TestMiniMaxM3Modeling(unittest.TestCase):
         output = mlp(hidden_states)
 
         all_gather.assert_called_once_with(hidden_states)
+        reduce_scatter.assert_called_once()
+        torch.testing.assert_close(output, hidden_states + 2)
+
+    @patch("vllm_ascend.models.minimax_m3.minimax_m3.sp_reduce_scatter")
+    @patch("vllm_ascend.models.minimax_m3.minimax_m3.sp_all_gather")
+    def test_dense_mlp_agmm_skips_external_all_gather(
+        self,
+        all_gather: Mock,
+        reduce_scatter: Mock,
+    ) -> None:
+        class _Linear(nn.Module):
+            def forward(self, value):
+                return value + 1, None
+
+        mlp = MiniMaxM3MLP.__new__(MiniMaxM3MLP)
+        nn.Module.__init__(mlp)
+        mlp.is_sequence_parallel = True
+        mlp.fuse_gate_up_all_gather_mm = True
+        mlp.gate_up_proj = _Linear()
+        mlp.act_fn = nn.Identity()
+        mlp.down_proj = _Linear()
+        hidden_states = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        reduce_scatter.side_effect = lambda value: value[:2]
+
+        output = mlp(hidden_states)
+
+        # The fused gate_up projection owns the AllGather; the MLP still
+        # reduces the down-projection output back to the SP shard.
+        all_gather.assert_not_called()
         reduce_scatter.assert_called_once()
         torch.testing.assert_close(output, hidden_states + 2)
 

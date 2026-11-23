@@ -173,6 +173,9 @@ class HardwareCapability(Enum):
     # Fuse an unquantized BF16 matmul with the TP ReduceScatter over AIV
     # communication, returning the SP token shard.
     MM_REDUCE_SCATTER_BF16 = auto()
+    # Fuse an INT8 per-token/per-channel quantized matmul with the TP
+    # ReduceScatter over AIV communication, returning the SP token shard.
+    MM_REDUCE_SCATTER_INT8_AIV = auto()
     NPUGRAPH_EX = auto()
     # Use ``torch_npu.npu_top_k_top_p`` for sampling instead of pytorch fallback.
     NPU_TOP_K_TOP_P = auto()
@@ -406,6 +409,7 @@ _A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
     HardwareCapability.RMS_NORM_DYNAMIC_QUANT,
     HardwareCapability.MC2_FULLMESH_V2_COMM,
     HardwareCapability.MM_REDUCE_SCATTER_BF16,
+    HardwareCapability.MM_REDUCE_SCATTER_INT8_AIV,
     HardwareCapability.QWEN4EXP_HC_GATE_MIX_ROW_BLOCK,
     HardwareCapability.RMS_NORM_CAST,
 }

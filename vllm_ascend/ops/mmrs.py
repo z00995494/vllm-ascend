@@ -12,12 +12,15 @@ from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.common.ops.sequence_parallel import sp_reduce_scatter
 from vllm_ascend.ops.linear_op import CustomRowParallelOp
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND
+from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ
 
 
 class SequenceParallelMMReduceScatterOp(CustomRowParallelOp):
@@ -183,3 +186,239 @@ class SequenceParallelMMReduceScatterOp(CustomRowParallelOp):
             self.tp_size,
             reduce_op="sum",
         )
+
+
+def _sequence_parallel_int8_mmrs(x: torch.Tensor, layer_name: str, output_size: int, tp_size: int) -> torch.Tensor:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    return layer.custom_op.run(x)
+
+
+def _sequence_parallel_int8_mmrs_fake(x: torch.Tensor, layer_name: str, output_size: int, tp_size: int) -> torch.Tensor:
+    return x.new_empty(((x.shape[0] + tp_size - 1) // tp_size, output_size))
+
+
+# Keep runtime metadata, NZ inspection and modulo padding out of Dynamo. In
+# particular, a decode/dummy trace must not permanently disable prefill fusion.
+direct_register_custom_op(
+    op_name="ascend_sequence_parallel_int8_mmrs",
+    op_func=_sequence_parallel_int8_mmrs,
+    fake_impl=_sequence_parallel_int8_mmrs_fake,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+
+class SequenceParallelQuantMMReduceScatterOp(CustomRowParallelOp):
+    """W8A8_DYNAMIC INT8 projection owning the post-attention ReduceScatter.
+
+    Mirrors SequenceParallelMMReduceScatterOp for INT8 W8A8_DYNAMIC layers:
+    installed by the model when sequence parallelism is active, it replaces
+    the whole forward with the fused quant MMRS when possible and with the
+    plain quant MM + ReduceScatter otherwise. Both paths return the SP token
+    shard, so the caller never branches.
+
+    Weight and scale references are read at execution time, after the
+    loader's transformations (including the INT8 weight transpose and the
+    optional NZ cast). This CANN version rejects internal-format (NZ) MMRS
+    operands, while any nonzero weight_nz_mode casts loaded INT8 weights to
+    NZ; the fused path therefore converts the weight back to ND once and
+    caches the copy. Per-token quantization is row-local, so the fused and
+    fallback chains agree bit-exactly.
+    """
+
+    SUPPORTED_TP_SIZES = (2, 4, 8)
+    MIN_K = 256
+    MAX_K = 65535
+
+    def __init__(self, layer, attention_layer_name: str, *, min_tokens: int, max_tokens: int):
+        super().__init__(layer)
+        self.update_attrs()
+        self.attention_layer_name = attention_layer_name
+        self.min_tokens = min_tokens
+        self.max_tokens = max_tokens
+        # A custom op already owning the layer's communication (e.g.
+        # fine-grained OTP) keeps ownership; this op only delegates to it.
+        self._previous_op = layer.custom_op
+        backend = self.comm_group.device_group._get_backend(torch.device("npu"))
+        self.hcom = backend.get_hccl_comm_name(self.tp_rank)
+        self._static_reason = self._find_static_reason()
+        if self._static_reason is None:
+            logger.info_once("Layer MMRS enabled for %s", self.prefix)
+        else:
+            logger.info_once("Layer MMRS disabled for %s: %s", self.prefix, self._static_reason)
+        # The registered custom op resolves the live layer through the
+        # compilation static forward context; linear layers do not
+        # self-register there (only attention layers do).
+        context = get_current_vllm_config().compilation_config.static_forward_context
+        existing = context.get(self.prefix)
+        if existing is not None and existing is not layer:
+            raise ValueError(f"Duplicate layer name: {self.prefix}")
+        context[self.prefix] = layer
+        self._nd_weight_source: torch.Tensor | None = None
+        self._nd_weight_version = -1
+        self._nd_weight: torch.Tensor | None = None
+
+    @staticmethod
+    def accepts(layer) -> bool:
+        """Whether the layer is an INT8 W8A8_DYNAMIC candidate.
+
+        The model uses this to choose between the BF16 and the INT8 backend
+        at construction; every other gate lives in _find_static_reason.
+        Do not accept subclasses such as FP8/PDMix with different scale ABIs.
+        """
+        quant_method = getattr(layer, "quant_method", None)
+        return (
+            isinstance(quant_method, AscendLinearMethod)
+            and type(quant_method.quant_method) is AscendW8A8DynamicLinearMethod
+        )
+
+    def _find_static_reason(self) -> str | None:
+        """Collect the facts fixed after loading; None leaves fusion possible."""
+        layer = self.layer
+        if self._previous_op is not None:
+            return "an existing custom linear op owns the communication"
+        if layer.reduce_results or not layer.input_is_parallel or layer.disable_tp:
+            return "requires a TP-partitioned input and an external ReduceScatter"
+        if layer.bias is not None:
+            return "only bias-free projections are supported"
+        if self.tp_size not in self.SUPPORTED_TP_SIZES:
+            return "requires TP size 2, 4 or 8"
+        if not callable(getattr(torch_npu, "npu_quant_mm_reduce_scatter", None)):
+            return "requires the torch_npu fused quant MM+ReduceScatter interface"
+        if not self.accepts(layer):
+            return "requires the INT8 W8A8_DYNAMIC scheme"
+        config = get_current_vllm_config()
+        # Pure decode nodes (PD-disaggregated kv_consumer) never see a
+        # prefill batch, so the fused path could never fire.
+        transfer = config.kv_transfer_config
+        if transfer is not None and transfer.is_kv_consumer and not transfer.is_kv_producer:
+            return "a pure decode node never runs a prefill batch"
+        if config.lora_config is not None:
+            return "LoRA owns the projection weights"
+        # Context-parallel weight/group adaptations have a separate
+        # ownership contract. Only the original TP group is supported.
+        if (
+            config.parallel_config.prefill_context_parallel_size != 1
+            or config.parallel_config.decode_context_parallel_size != 1
+        ):
+            return "context parallelism owns the TP group"
+        if not get_current_hardware_profile().supports(HardwareCapability.MM_REDUCE_SCATTER_INT8_AIV):
+            return "hardware does not support the INT8 MM ReduceScatter kernel"
+        return None
+
+    def apply_impl(self, input_: torch.Tensor):
+        if self._previous_op is not None:
+            return self._previous_op.apply_impl(input_)
+        output = torch.ops.vllm.ascend_sequence_parallel_int8_mmrs(
+            input_, self.prefix, self.layer.output_size, self.tp_size
+        )
+        return output, None
+
+    def run(self, input_: torch.Tensor) -> torch.Tensor:
+        # The only fused/fallback branch; every gate lives in _can_fuse and
+        # is evaluated per forward, before any collective.
+        if not self._can_fuse(input_):
+            return self._run_fallback(input_)
+        return self._run_fused(input_)
+
+    def _can_fuse(self, x: torch.Tensor) -> bool:
+        if self._static_reason is not None:
+            return False
+        if not is_forward_context_available():
+            return False
+        metadata = get_forward_context().attn_metadata
+        if isinstance(metadata, dict):
+            metadata = metadata.get(self.attention_layer_name)
+        # Missing metadata includes dummy/profile runs. Decode and mixed
+        # batches stay on the existing path, including FULL_DECODE_ONLY capture.
+        if metadata is None or getattr(metadata, "num_prefills", 0) <= 0 or getattr(metadata, "num_decodes", None) != 0:
+            return False
+        if x.ndim != 2 or x.dtype != torch.bfloat16 or x.shape[0] == 0:
+            return False
+        if not self.MIN_K <= x.shape[1] < self.MAX_K:
+            return False
+        # The model gates the token count to the INT8 benefit range; TP
+        # ranks see the same count after the SP all-gather.
+        if not self.min_tokens <= x.shape[0] < self.max_tokens:
+            return False
+        return self._weight_supported(x)
+
+    def _weight_supported(self, x: torch.Tensor) -> bool:
+        """Check the weight/scale layout for the fused kernel, per forward.
+
+        Loading finishes before the first forward, so a replaced or
+        in-place-mutated weight is revalidated on the very next call.
+        """
+        weight = self.layer.weight
+        scale = getattr(self.layer, "weight_scale_fp32", None)
+        basic = (
+            weight.ndim == 2
+            and weight.dtype == torch.int8
+            and weight.shape == (x.shape[1], self.layer.output_size)
+            and self.layer.output_size > 0
+            and weight.is_contiguous()
+            and scale is not None
+            and scale.dtype == torch.float32
+            and scale.shape == (self.layer.output_size,)
+        )
+        return basic and torch_npu.get_npu_format(weight) in (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ)
+
+    def _nd_weight_for_fusion(self) -> torch.Tensor:
+        """Return an ND copy of the loaded INT8 weight, converting NZ once.
+
+        The NZ-to-ND cast is value-preserving. The cache is rebuilt only when
+        the weight tensor is replaced or mutated in place; loading finishes
+        before the first forward, so this stays TP-consistent.
+        """
+        weight = self.layer.weight
+        if self._nd_weight_source is weight and self._nd_weight_version == weight._version:
+            return self._nd_weight
+        nd_weight = torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_ND)
+        self._nd_weight_source = weight
+        self._nd_weight_version = weight._version
+        self._nd_weight = nd_weight
+        return nd_weight
+
+    def _run_fallback(self, input_: torch.Tensor) -> torch.Tensor:
+        """Plain quant MM + ReduceScatter fallback returning the SP shard."""
+        assert self.quant_method is not None
+        input_parallel = self.get_input_parallel(input_)
+        # Bias-free static gate: nothing is added on any rank.
+        output = self.quant_method.apply(self.layer, input_parallel, None)
+        # The caller dropped its external ReduceScatter; this op returns
+        # the SP token shard on every path.
+        return sp_reduce_scatter(output)
+
+    def _run_fused(self, input_: torch.Tensor) -> torch.Tensor:
+        """INT8 quant MM + ReduceScatter through the fused path.
+
+        sp_reduce_scatter zero-pads the GEMM result to the TP multiple, so
+        padding the quantized input rows beforehand yields the same shard.
+        Zero INT8 rows with scale one represent exact zero and avoid
+        dynamic_quant's zero-input scale behavior.
+        """
+        scheme = self.quant_method.quant_method
+        prepared = scheme.prepare_input_for_overlap(self.layer, input_.contiguous())
+        assert prepared is not None and prepared.scale is not None
+        quantized = prepared.quantized
+        token_scale = prepared.scale.reshape(-1, 1)
+        padding = (-quantized.shape[0]) % self.tp_size
+        if padding:
+            quantized = F.pad(quantized, (0, 0, 0, padding))
+            token_scale = F.pad(token_scale, (0, 0, 0, padding), value=1.0)
+        weight = self.layer.weight
+        if torch_npu.get_npu_format(weight) == ACL_FORMAT_FRACTAL_NZ:
+            weight = self._nd_weight_for_fusion()
+        logger.info_once("Layer MMRS fused path active")
+        output, _ = torch_npu.npu_quant_mm_reduce_scatter(
+            quantized,
+            weight,
+            self.hcom,
+            self.tp_size,
+            x1_scale=token_scale.contiguous(),
+            x2_scale=self.layer.weight_scale_fp32.reshape(1, -1).contiguous(),
+            y_dtype=torch.bfloat16,
+            reduce_op="sum",
+            comm_mode="aiv",
+        )
+        return output
